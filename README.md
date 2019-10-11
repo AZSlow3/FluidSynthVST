@@ -33,11 +33,15 @@ All credits should go to FluidSynth developers: https://github.com/FluidSynth/fl
    Archives for Linux/Ubuntu 18.04 64bit and Windows 64bit can be found in the
    bin subdirectory
 - download some SF2 with sounds you need (see FluidSynth documentation for some or just
-   search the Internet for GM SoundFont 2. Put it as "default.sf2" into the same directory
+   search the Internet for GM SoundFont 2. Put it as "default.sf2" into the same directory.
+   You can add additional SF files into that directory
 - point your DAW to use the directory for VST3
+- used SoundFont can be switched using host's preset system, undef "build-in presets".
 
 ## Known limitations
+- FluidSynth plays samples from disk, without preloading.
 - there is no GUI
-- it is not possible to change used font on the fly
 - current instrument settings are not saved (MIDI source normally have them)
 - stereo output only
+- (VSTGUI common) in case REAPER crash on Linux, run it under gdb. If crash happens in "cairo_scaled_font_status", "Arial" font/style could
+  not be found. Check with "fc_match Arial".

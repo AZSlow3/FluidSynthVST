@@ -18,8 +18,11 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
+#include <algorithm>
+
 #include "public.sdk/source/main/pluginfactory.h"
 #include "base/source/fstreamer.h"
+#include "base/source/fbuffer.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
 
@@ -29,10 +32,36 @@
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/vsttypes.h"
+#include "pluginterfaces/vst/ivstattributes.h"
 
 namespace FluidSynthVST {
 using namespace Steinberg;
 
+
+#ifdef WIN32
+#else /* Linux */
+#include <time.h>
+
+class PerfMeter {
+  private:
+    struct timespec start_ts;
+    struct timespec end_ts;
+    unsigned long long md;
+    char *pfx;
+
+  public:
+    PerfMeter(const char *prefix = "Perf", unsigned long long min_diff = 1) : md(min_diff){
+      clock_gettime(CLOCK_REALTIME, &start_ts);
+      pfx = strdup(prefix);
+    }
+    ~PerfMeter(){
+      clock_gettime(CLOCK_REALTIME, &end_ts);
+      unsigned long long td = (end_ts.tv_sec - start_ts.tv_sec)*1000000 + (end_ts.tv_nsec - start_ts.tv_nsec)/1000;
+      if(td >= md)
+	printf("%s: %llu uSec\n", pfx, td);
+    }
+};
+#endif /* platform */
 
 // CC Names
 static const char *szCCName[Vst::kCountCtrlNumber] = {
@@ -137,27 +166,39 @@ static const char *szCCName[Vst::kCountCtrlNumber] = {
 
 
 // Processor
-Processor::Processor() : mSynth(NULL) /*, mAudioBufsSize(0) */ {
+Processor::Processor() : mSynth(NULL), mChangeSoundFont(false), mLoadingThread(0) /*, mAudioBufsSize(0) */ {
   setControllerClass(ControllerUID);
   mSynthSettings = new_fluid_settings();
   mSynth = new_fluid_synth(mSynthSettings);
 
-  char szFileName[FILENAME_MAX];
-  GetPath(szFileName, FILENAME_MAX);
-  PathAppend(szFileName, FILENAME_MAX, "default.sf2");
+  scanSoundFonts();
 
-  if((mSoundFoundID = fluid_synth_sfload(mSynth, szFileName, 1)) == FLUID_FAILED){
-    printf("Failed '%s'...\n", szFileName);
-  } else {
-    //printf("Loaded...\n");
-  }
   /*
   mAudioBufs[0] = NULL;
   mAudioBufs[1] = NULL;
   */
 }
 
+void Processor::syncedLoadSoundFont() {
+  char fileName[FILENAME_MAX];
+  GetPath(fileName, FILENAME_MAX);
+  PathAppend(fileName, FILENAME_MAX, mLoadingFile.text8());
+
+  fluid_synth_all_notes_off(mSynth, -1);
+  fluid_synth_all_sounds_off(mSynth, -1);
+  if(fluid_synth_sfcount(mSynth) > 0){
+    // unload old one
+    int id = fluid_sfont_get_id(fluid_synth_get_sfont(mSynth, 0));
+    fluid_synth_sfunload(mSynth, id, 1);
+  }
+  if((mSoundFoundID = fluid_synth_sfload(mSynth, fileName, 1)) == FLUID_FAILED){
+    printf("Failed '%s'...\n", fileName);
+  }
+  mLoadingComplete = true;
+}
+
 Processor::~Processor() {
+  checkSoundFont(true); // to stop the thread, if any
   if(mSynth){
     delete_fluid_synth(mSynth);
     mSynth = NULL;
@@ -203,10 +244,12 @@ tresult PLUGIN_API Processor::canProcessSampleSize(int32 symbolicSampleSize){
 tresult PLUGIN_API Processor::setupProcessing(Vst::ProcessSetup& setup){
   tresult result = AudioEffect::setupProcessing(setup);
   if(result == kResultTrue){
+    // printf("Processor: SetupProcessing\n");
     // TODO: set FR, block size, etc.
     if(fluid_settings_setnum(mSynthSettings, "synth.sample-rate", setup.sampleRate) == FLUID_FAILED){
       printf("Could not set sample rate to %f\n", setup.sampleRate);
     }
+    checkSoundFont(true); // load the font, in case it is already specified (normally should be the case)
     /*
     if((setup.sampleRate == Vst::kSample64) && (mAudioBufsSize < setup.maxSamplesPerBlock)){
       // we should be called with real time stopped
@@ -230,9 +273,9 @@ tresult PLUGIN_API Processor::setActive(TBool state){
   tresult result = AudioEffect::setActive(state);
   if(result == kResultTrue){
     if(state){
-      // TODO: arm
+      //printf("Processor: activated\n");
     } else {
-      // TODO: disarm
+      //printf("Processor: deactivated\n");
     }
   }
   return result;
@@ -242,13 +285,17 @@ void Processor::writeAudio(Vst::ProcessData& data, int32 start_sample, int32 end
   if((data.numSamples < end_sample) || (start_sample >= end_sample) || (data.numOutputs < 1) || (data.outputs[0].numChannels < 2))
     return;
 
-
-
   if(data.symbolicSampleSize == Vst::kSample32){
-    if(fluid_synth_write_float(mSynth, end_sample - start_sample,
-			       data.outputs[0].channelBuffers32[0] + start_sample, 0, 1,
-			      data.outputs[0].channelBuffers32[1] + start_sample, 0, 1) == FLUID_FAILED){
-      printf("Generation failed\n");
+    if(!checkSoundFont(false)){
+      // the synth is not ready
+      memset(data.outputs[0].channelBuffers32[0] + start_sample, 0, sizeof(float) * (end_sample - start_sample));
+      memset(data.outputs[0].channelBuffers32[1] + start_sample, 0, sizeof(float) * (end_sample - start_sample));
+    } else {
+      if(fluid_synth_write_float(mSynth, end_sample - start_sample,
+				data.outputs[0].channelBuffers32[0] + start_sample, 0, 1,
+				data.outputs[0].channelBuffers32[1] + start_sample, 0, 1) == FLUID_FAILED){
+	//printf("Generation failed\n");
+      }
     }
   } else {
     // MAYBE TODO: handle 64bit audio case
@@ -317,7 +364,23 @@ void Processor::playParChanges(Vst::ProcessData& data, int32 curSample, int32 en
 	    case FluidSynthVSTParams::kBypassId:
 	      mBypass = (value > 0.5f);
 	      break;
+	    case FluidSynthVSTParams::kRootPrgId:
+	      // we can not change here, but we schedule the change on restart
+	      if(mSoundFontFiles.size()){
+		int32 soundFontIdx = (value*(mSoundFontFiles.size()-1) + 0.5);
+		if(mSoundFontFile != mSoundFontFiles.at(soundFontIdx)){
+		  mSoundFontFile = mSoundFontFiles.at(soundFontIdx);
+		  mChangeSoundFont = true;
+		  //printf("Processor: will change font to %s\n", mSoundFontFile.text8());
+		  checkSoundFont(false);
+		}
+	      }
+	      break;
 	    default:
+	      if(!checkSoundFont(false)){
+		// the synth is not ready
+		break;
+	      }
 	      if(id >= 1024){
 		int32 ch = id / 1024 - 1;
 	        int32 ctrlNumber = id%1024;
@@ -358,7 +421,7 @@ void Processor::playEvents(Vst::ProcessData& data, int32 curSample, int32 endSam
       switch(e.type){
 	case Vst::Event::kNoteOnEvent:
 	  if(fluid_synth_noteon(mSynth, e.noteOn.channel, e.noteOn.pitch, e.noteOn.velocity*127. + 0.5) == FLUID_FAILED){
-	    printf("NoteOn failed\n");
+	    //printf("NoteOn failed\n");
 	  }
 	  break;
 	case Vst::Event::kNoteOffEvent:
@@ -374,8 +437,9 @@ void Processor::playEvents(Vst::ProcessData& data, int32 curSample, int32 endSam
   }
 }
 
-
 tresult PLUGIN_API Processor::process(Vst::ProcessData& data){
+  //PerfMeter pm("Process", 8000);
+  //printf("*\n");
 
   if((data.numOutputs <= 0) || (data.numSamples <= 0))
     return kResultOk;
@@ -402,17 +466,55 @@ tresult PLUGIN_API Processor::process(Vst::ProcessData& data){
   return kResultOk;
 }
 
+tresult PLUGIN_API Processor::setProcessing (TBool state){
+  if(state){
+    //printf("Processor: started\n");
+  } else {
+    //printf("Processor: ended\n");
+  }
+  return kResultTrue;
+}
+
+float Processor::getCurrentSoundFontNormalized(){
+  auto it = std::find(mSoundFontFiles.begin(), mSoundFontFiles.end(), mSoundFontFile);
+  if((mSoundFontFiles.size() < 2) || (it == mSoundFontFiles.end()))
+    return 0.;
+  return (float)(it - mSoundFontFiles.begin()) / (mSoundFontFiles.size() - 1);
+}
+
+
 tresult PLUGIN_API Processor::setState(IBStream* state){
   if(!state)
     return kResultFalse;
+
+  //printf("Processor: setState\n");
 
   IBStreamer streamer(state, kLittleEndian);
 
   int32 savedBypass = 0;
   if(streamer.readInt32(savedBypass) == false)
     return kResultFalse;
-
   mBypass = savedBypass > 0;
+
+  char *soundFontFile;
+  if(!(soundFontFile = streamer.readStr8())){
+    // can be, the first version was not saving it
+    mSoundFontFile = "default.sf2";
+    //printf("Processor: using default font\n");
+  } else {
+    mSoundFontFile = soundFontFile;
+    delete soundFontFile;
+    //printf("Processor: State font: %s\n", mSoundFontFile.text8());
+  }
+  auto it = std::find(mSoundFontFiles.begin(), mSoundFontFiles.end(), mSoundFontFile);
+  if(it == mSoundFontFiles.end()){
+    if(mSoundFontFiles.size() > 0){
+      mSoundFontFile = mSoundFontFiles.at(0);
+      printf("Processor: font not found, using first available font\n");
+    }
+  }
+  mChangeSoundFont = true;
+  sendCurrentProgram();
 
   return kResultOk;
 }
@@ -420,10 +522,49 @@ tresult PLUGIN_API Processor::setState(IBStream* state){
 tresult PLUGIN_API Processor::getState(IBStream* state){
   int32 toSaveBypass = mBypass ? 1 : 0;
 
+  //printf("Processor: getState\n");
+
   IBStreamer streamer(state, kLittleEndian);
-  streamer.writeInt32 (toSaveBypass);
+  streamer.writeInt32(toSaveBypass);
+  streamer.writeStr8(mSoundFontFile.text8());
+  //printf("   Current sound font: %s\n", mSoundFontFile.text8());
 
   return kResultOk;
+}
+
+tresult PLUGIN_API Processor::connect (IConnectionPoint* other){
+  if(Vst::AudioEffect::connect(other) == kResultOk){
+    //printf("Processor: connected\n");
+    Steinberg::Buffer buf;
+    // TODO: fill it
+    for(auto const& fileName : mSoundFontFiles){
+      String name;
+      fileName.extract(name, 0, fileName.length() - 4); // remove ".sfX"
+      buf.appendString8(name); // UTF-8
+      buf.endString8();
+    }
+    Vst::IMessage* message = allocateMessage();
+    FReleaser msgReleaser(message);
+    if(message){
+      message->setMessageID("SoundFontFiles");
+      message->getAttributes()->setBinary("List", buf, buf.getFillSize());
+      //printf("  sending %d, first: %s\n", buf.getFillSize(), buf.str8());
+      sendMessage(message);
+    }
+    return kResultOk;
+  }
+  return kResultFalse;
+}
+
+void Processor::sendCurrentProgram(){
+  float cSoundFontNorm = getCurrentSoundFontNormalized();
+  Vst::IMessage* message = allocateMessage();
+  FReleaser msgReleaser(message);
+  if(message){
+    message->setMessageID("CurrentSoundFont");
+    message->getAttributes()->setBinary("Value", &cSoundFontNorm, sizeof(float));
+    sendMessage(message);
+  }
 }
 
 // Controller
@@ -434,31 +575,22 @@ tresult PLUGIN_API Controller::initialize(FUnknown* context){
   if(result != kResultOk){
     return result;
   }
+
   parameters.addParameter(STR16("Bypass"), nullptr, 1, 0,
 			  Vst::ParameterInfo::kCanAutomate | Vst::ParameterInfo::kIsBypass,
 			  FluidSynthVSTParams::kBypassId);
 
   addUnit(new Vst::Unit(String("Root"), Vst::kRootUnitId, Vst::kNoParentUnitId, kRootPrgId /* Vst::kNoProgramListId */));
 
-/*
-    Vst::ProgramList* prgList = new Vst::ProgramList(String("Program"), kRootPrgId, Vst::kRootUnitId);
-    addProgramList(prgList);
-    for(int32 i = 0; i < 128; i++){
-      String title;
-      title.printf("Prog %d", i);
-      prgList->addProgram(title);
-    }
+  // register so far empty Sound Font list and its parameter
+  Vst::ProgramList* prgList = new Vst::ProgramList(String("Sound Font"), kRootPrgId, Vst::kRootUnitId);
+  addProgramList(prgList);
+  prgList->addProgram(String("default")); // something crash otherwise...
 
-    Vst::Parameter* prgParam = prgList->getParameter();
-    prgParam->getInfo().flags &= ~Vst::ParameterInfo::kCanAutomate;
-    parameters.addParameter(prgParam);
-*/
+  Vst::Parameter* prgParam = prgList->getParameter();
+  prgParam->getInfo().flags &= ~Vst::ParameterInfo::kCanAutomate;
+  parameters.addParameter(prgParam);
 
-  /*
-  parameters.addParameter(String("RootPrg"), nullptr, 127, 0,
-                    Vst::ParameterInfo::kIsProgramChange | Vst::ParameterInfo::kIsList,
-                    kRootPrgId, Vst::kRootUnitId);
-  */
 
   for(int32 ch = 0; ch < 16; ++ch){
     Vst::UnitID unitId = ch + 1;
@@ -506,9 +638,65 @@ tresult PLUGIN_API Controller::initialize(FUnknown* context){
   return kResultOk;
 }
 
+tresult PLUGIN_API Controller::notify (Vst::IMessage* message){
+  if(!message)
+    return kInvalidArgument;
+  //printf("Controller: Notify\n");
+  FIDString messageID = message->getMessageID();
+  uint32 messageSize = 0;
+  const char *messageData = NULL;
+  if(!strcmp(messageID, "SoundFontFiles")){
+    //printf(" SoundFontFiles\n");
+    if(message->getAttributes()->getBinary("List", (const void *&)messageData, messageSize) == kResultOk){
+      // that should be an array of UTF8 strings
+      if(messageData && messageSize && !messageData[messageSize - 1]){
+	auto prgList = getProgramList(kRootPrgId);
+	auto prgPar  = dynamic_cast<Vst::StringListParameter *>(prgList->getParameter());
+	bool replaced = false; // there is no call to clear the list, so we replace the program name...
+	if(prgList && prgPar){
+	  const char *messageEnd = messageData + messageSize;
+	  while(messageData < messageEnd){
+	    String soundFont;
+	    soundFont.fromUTF8(messageData);
+	    if(replaced){
+	      prgList->addProgram(soundFont);
+	      prgPar->appendString(soundFont);
+	    } else {
+	      prgList->setProgramName(0, soundFont);
+	      prgPar->replaceString(0, soundFont);
+	      replaced = true;
+	    }
+	    messageData += strlen(messageData) + 1;
+	  }
+	  // TODO: set current value for parameter
+	  if(componentHandler)
+	    componentHandler->restartComponent(Vst::kParamValuesChanged);
+	  notifyProgramListChange(kRootPrgId); // Ask host to redraw possible "build-in presets"
+	  return kResultTrue;
+	}
+      }
+    }
+  } else if(!strcmp(messageID, "CurrentSoundFont")){
+    //printf(" CurrentSoundFont\n");
+    if(message->getAttributes()->getBinary("Value", (const void *&)messageData, messageSize) == kResultOk){
+      // that should be an array of UTF8 strings
+      if(messageData && (messageSize == sizeof(float))){
+	float cSoundFontNorm;
+	memcpy(&cSoundFontNorm, messageData, sizeof(float));
+	setParamNormalized(kRootPrgId, cSoundFontNorm); // processor had to precalculate correct value for us
+	return kResultTrue;
+      }
+    }
+  }
+  return kResultFalse;
+}
+
+
 tresult PLUGIN_API Controller::setComponentState(IBStream* state){
   if(!state)
     return kResultFalse;
+
+  //printf("Controller: setComponentState\n");
 
   IBStreamer streamer(state, kLittleEndian);
 
@@ -517,6 +705,10 @@ tresult PLUGIN_API Controller::setComponentState(IBStream* state){
     return kResultFalse;
   setParamNormalized(kBypassId, bypassState ? 1 : 0);
 
+  char *soundFontFileName;
+  if(soundFontFileName = streamer.readStr8()){
+    delete soundFontFileName;
+  }
   return kResultOk;
 }
 
@@ -544,6 +736,17 @@ tresult PLUGIN_API Controller::getUnitByBus(Vst::MediaType type, Vst::BusDirecti
   }
   return kResultFalse;
 }
+
+tresult PLUGIN_API Controller::setParamNormalized (Vst::ParamID tag, Vst::ParamValue value){
+  tresult result = EditControllerEx1::setParamNormalized(tag, value);
+  if(result == kResultOk){
+    if(tag == kRootPrgId){
+      //printf("Controller: SoundFont set to %f\n", value);
+    }
+  }
+  return result;
+}
+
 
 } // FluidSynthVST
 
@@ -635,7 +838,7 @@ void glib_DllMain(void *moduleHandle, DWORD fdwReason, LPVOID lpvReserved){
 
 }
 
-void FluidSynthVST::Processor::GetPath(char *szPath /* Out */, int32 size){
+void FluidSynthVST::GetPath(char *szPath /* Out */, int32 size){
   WCHAR wszPath[MAX_PATH];
   if(GetModuleFileName((HMODULE)moduleHandle, wszPath, MAX_PATH) > 0){
     wszPath[MAX_PATH - 1] = 0;
@@ -650,19 +853,88 @@ void FluidSynthVST::Processor::GetPath(char *szPath /* Out */, int32 size){
   *szPath = 0;
 }
 
-void FluidSynthVST::Processor::PathAppend(char *szPath /* Out */, int32 size, const char *szName){
+void FluidSynthVST::PathAppend(char *szPath /* Out */, int32 size, const char *szName){
   if(size <= (strlen(szPath) + strlen(szName) + 1))
     return;
   strcat(szPath, "\\");
   strcat(szPath, szName);
 }
 
+void FluidSynthVST::Processor::scanSoundFonts(){
+  WCHAR szName[MAX_PATH];
+  if(GetModuleFileNameW((HMODULE)moduleHandle, szName, MAX_PATH) <= 0)
+    return;
+  szName[MAX_PATH - 1] = 0;
+  WCHAR *slash = wcsrchr(szName, L'\\');
+  if(slash)
+    *slash = 0;
+  wcscat(szName, L"\\*.sf?");
+
+  HANDLE hFind;
+  WIN32_FIND_DATA FindData;
+  if((hFind = FindFirstFileW(szName, &FindData)) != INVALID_HANDLE_VALUE){
+    do {
+      slash = wcsrchr(FindData.cFileName, L'\\');
+      if(slash)
+	++slash;
+      else
+	slash = FindData.cFileName;
+      String s(slash);
+      s.toMultiByte(kCP_Utf8);
+      mSoundFontFiles.push_back( s );
+    } while(FindNextFileW(hFind, &FindData));
+    FindClose(hFind);
+    std::sort(mSoundFontFiles.begin(), mSoundFontFiles.end());
+  }
+}
+
+static DWORD WINAPI Processor_LoadingThread(void *par){
+  auto processor = static_cast<FluidSynthVST::Processor *>(par);
+  processor->syncedLoadSoundFont();
+  return NULL;
+}
+
+/*
+ * Returns true in case the synth can be used.
+ * Initiate font loading, synced or asynced as specified in case that was requested.
+ * Also finish loading in specified mode
+ *
+ * It is not thread safe, but it can be called from
+ * destructor, setProcessing or process only. Host should never
+ * parallelize any of them.
+ */
+bool FluidSynthVST::Processor::checkSoundFont(bool synced){
+  //PerfMeter pm("Check", 8000);
+  if(mLoadingThread){
+    if(mLoadingComplete || synced){
+      CloseHandle(mLoadingThread);
+      mLoadingThread = 0;
+      //printf("Processor: loading font complete\n");
+    } else
+      return false;
+  }
+  if(!mChangeSoundFont)
+    return true;
+  //printf("Processor: changing sound font %s\n", synced ? "synced" : "asynced");
+  mLoadingFile = mSoundFontFile;
+  mChangeSoundFont = false;
+  if(!synced){
+    mLoadingComplete = false;
+    if((mLoadingThread = CreateThread(NULL, 0, Processor_LoadingThread, this, 0, NULL)))
+      return false;
+    printf("Could not create loading thread, continue in synced mode\n");
+  }
+  syncedLoadSoundFont();
+  return true;
+}
+
+
 #else /* Linux */
 #define glib_DllMain(x,y,z)
 
 #include <dlfcn.h>
 
-void FluidSynthVST::Processor::GetPath(char *szPath /* Out */, int32 size){
+void FluidSynthVST::GetPath(char *szPath /* Out */, int32 size){
   Dl_info info;
   if(!dladdr(&moduleHandle, &info) || (strlen(info.dli_fname) > (size - 1))){
     *szPath = 0;
@@ -674,11 +946,73 @@ void FluidSynthVST::Processor::GetPath(char *szPath /* Out */, int32 size){
   }
 }
 
-void FluidSynthVST::Processor::PathAppend(char *szPath /* Out */, int32 size, const char *szName){
+void FluidSynthVST::PathAppend(char *szPath /* Out */, int32 size, const char *szName){
   if(size <= (strlen(szPath) + strlen(szName) + 1))
     return;
   strcat(szPath, "/");
   strcat(szPath, szName);
+}
+
+#include <sys/types.h>
+#include <dirent.h>
+
+void FluidSynthVST::Processor::scanSoundFonts(){
+  char szDirName[FILENAME_MAX];
+  GetPath(szDirName, FILENAME_MAX);
+  DIR *dir = opendir(szDirName);
+  if(dir){
+    struct dirent *de;
+    while((de = readdir(dir))){
+      if((strlen(de->d_name) > 4) && !memcmp(de->d_name + strlen(de->d_name) - 4, ".sf", 3)){
+	mSoundFontFiles.push_back( de->d_name ); // will be in file system encoding, hope it is UTF8
+      }
+    }
+    closedir(dir);
+    std::sort(mSoundFontFiles.begin(), mSoundFontFiles.end());
+  }
+}
+
+#include <pthread.h>
+
+static void *Processor_LoadingThread(void *par){
+  auto processor = static_cast<FluidSynthVST::Processor *>(par);
+  processor->syncedLoadSoundFont();
+  return NULL;
+}
+
+/*
+ * Returns true in case the synth can be used.
+ * Initiate font loading, synced or asynced as specified in case that was requested.
+ * Also finish loading in specified mode
+ *
+ * It is not thread safe, but it can be called from
+ * destructor, setProcessing or process only. Host should never
+ * parallelize any of them.
+ */
+bool FluidSynthVST::Processor::checkSoundFont(bool synced){
+  //PerfMeter pm("Check", 8000);
+  if(mLoadingThread){
+    if(mLoadingComplete || synced){
+      pthread_join(mLoadingThread, NULL);
+      mLoadingThread = 0;
+      //printf("Processor: loading font complete\n");
+    } else
+      return false;
+  }
+  if(!mChangeSoundFont)
+    return true;
+  //printf("Processor: changing sound font %s\n", synced ? "synced" : "asynced");
+  mLoadingFile = mSoundFontFile;
+  mChangeSoundFont = false;
+  if(!synced){
+    mLoadingComplete = false;
+    if(!pthread_create(&mLoadingThread, NULL, Processor_LoadingThread, this)){
+      return false;
+    }
+    printf("Could not create loading thread, continue in synced mode\n");
+  }
+  syncedLoadSoundFont();
+  return true;
 }
 
 #endif

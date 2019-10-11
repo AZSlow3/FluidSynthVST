@@ -24,8 +24,15 @@
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
+#include "pluginterfaces/vst/ivstmessage.h"
 
 #include "fluidsynth.h"
+
+#ifdef WIN32
+#include <windows.h>
+#else /* Linux */
+#include <pthread.h>
+#endif /* Platform */
 
 #define MAJOR_VERSION_STR "0"
 #define MAJOR_VERSION_INT 0
@@ -36,8 +43,8 @@
 #define RELEASE_NUMBER_STR "0"
 #define RELEASE_NUMBER_INT 0
 
-#define BUILD_NUMBER_STR "1"
-#define BUILD_NUMBER_INT 1
+#define BUILD_NUMBER_STR "2"
+#define BUILD_NUMBER_INT 2
 
 #define FULL_VERSION_STR MAJOR_VERSION_STR "." SUB_VERSION_STR "." RELEASE_NUMBER_STR "." BUILD_NUMBER_STR
 
@@ -76,10 +83,13 @@ class Controller : public Vst::EditControllerEx1, public Vst::IMidiMapping {
   public:
     tresult PLUGIN_API initialize(FUnknown* context) SMTG_OVERRIDE;
     tresult PLUGIN_API setComponentState(IBStream* state) SMTG_OVERRIDE;
+    tresult PLUGIN_API setParamNormalized (Vst::ParamID tag, Vst::ParamValue value) SMTG_OVERRIDE;
 
     tresult PLUGIN_API getMidiControllerAssignment (int32 busIndex, int16 channel, Vst::CtrlNumber midiControllerNumber, Vst::ParamID& id/*out*/) SMTG_OVERRIDE;
 
-    tresult PLUGIN_API getUnitByBus(Vst::MediaType type, Vst::BusDirection dir, int32 busIndex, int32 channel, Vst::UnitID& unitId /*out*/) SMTG_OVERRIDE;
+    tresult PLUGIN_API getUnitByBus (Vst::MediaType type, Vst::BusDirection dir, int32 busIndex, int32 channel, Vst::UnitID& unitId /*out*/) SMTG_OVERRIDE;
+
+    tresult PLUGIN_API notify (Vst::IMessage* message) SMTG_OVERRIDE;
 
     static FUnknown* createInstance (void*){
       return (IEditController*)new Controller();
@@ -92,6 +102,8 @@ class Controller : public Vst::EditControllerEx1, public Vst::IMidiMapping {
       DEF_INTERFACE(Vst::IMidiMapping)
     END_DEFINE_INTERFACES(Vst::EditControllerEx1)
     REFCOUNT_METHODS(Vst::EditControllerEx1)
+
+  protected:
 };
 
 class Processor : public Vst::AudioEffect {
@@ -103,16 +115,21 @@ class Processor : public Vst::AudioEffect {
 					  Vst::SpeakerArrangement* outputs, int32 numOuts) SMTG_OVERRIDE;
 
     tresult PLUGIN_API canProcessSampleSize (int32 symbolicSampleSize) SMTG_OVERRIDE;
-    tresult PLUGIN_API setupProcessing(Vst::ProcessSetup& setup) SMTG_OVERRIDE;
-    tresult PLUGIN_API setActive(TBool state) SMTG_OVERRIDE;
+    tresult PLUGIN_API setupProcessing (Vst::ProcessSetup& setup) SMTG_OVERRIDE;
+    tresult PLUGIN_API setActive (TBool state) SMTG_OVERRIDE;
+    tresult PLUGIN_API setProcessing (TBool state) SMTG_OVERRIDE;
     tresult PLUGIN_API process(Vst::ProcessData& data) SMTG_OVERRIDE;
 
     tresult PLUGIN_API setState (IBStream* state) SMTG_OVERRIDE;
     tresult PLUGIN_API getState (IBStream* state) SMTG_OVERRIDE;
 
+    tresult PLUGIN_API connect (IConnectionPoint* other) SMTG_OVERRIDE;
+
     static FUnknown* createInstance(void*){
       return (Vst::IAudioProcessor*)new Processor ();
     }
+
+    void    syncedLoadSoundFont(); // public for thread function
 
   protected:
     bool mBypass = false;
@@ -121,17 +138,38 @@ class Processor : public Vst::AudioEffect {
     fluid_synth_t* mSynth;
     int32          mSoundFoundID; // -1 when failed to load
 
+    using StringVector = std::vector<String>;
+    StringVector mSoundFontFiles; // in UTF-8
+    String       mSoundFontFile;
+    bool         mChangeSoundFont;
+
     float  *mAudioBufs[2];
     int32   mAudioBufsSize;
 
-    void writeAudio(Vst::ProcessData& data, int32 start_sample, int32 end_samle);
+
+    void  writeAudio(Vst::ProcessData& data, int32 start_sample, int32 end_samle);
     int32 nextOffset(Vst::ProcessData& data, int32 curSample);
     void  playParChanges(Vst::ProcessData& data, int32 curSample, int32 endSample);
     void  playEvents(Vst::ProcessData& data, int32 curSample, int32 endSample);
 
-    void GetPath(char *szPath /* Out */, int32 size);
-    void PathAppend(char *szPath /* Out */, int32 size, const char *szName);
+    void  scanSoundFonts();
+    bool  checkSoundFont(bool synced);
+    float getCurrentSoundFontNormalized();
+    void  sendCurrentProgram();
+
+  private:
+#ifdef WIN32
+    HANDLE     mLoadingThread;
+#else /* Linux */
+    pthread_t  mLoadingThread;
+#endif /* platform */
+    String       mLoadingFile;
+    bool         mLoadingComplete;
 };
+
+
+void GetPath(char *szPath /* Out */, int32 size);
+void PathAppend(char *szPath /* Out */, int32 size, const char *szName);
 
 }
 
