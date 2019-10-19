@@ -103,7 +103,8 @@ class Controller : public Vst::EditControllerEx1, public Vst::IMidiMapping {
     END_DEFINE_INTERFACES(Vst::EditControllerEx1)
     REFCOUNT_METHODS(Vst::EditControllerEx1)
 
-  protected:
+  private:
+    float mCurrentProgram;
 };
 
 class Processor : public Vst::AudioEffect {
@@ -136,7 +137,7 @@ class Processor : public Vst::AudioEffect {
 
     fluid_settings_t* mSynthSettings;
     fluid_synth_t* mSynth;
-    int32          mSoundFoundID; // -1 when failed to load
+    int32          mSoundFontID; // -1 when failed to load
 
     using StringVector = std::vector<String>;
     StringVector mSoundFontFiles; // in UTF-8
@@ -154,8 +155,10 @@ class Processor : public Vst::AudioEffect {
 
     void  scanSoundFonts();
     bool  checkSoundFont(bool synced);
+    int   getCurrentSoundFontIdx();
     float getCurrentSoundFontNormalized();
     void  sendCurrentProgram();
+    void  sendProgramList();
 
   private:
 #ifdef WIN32
@@ -163,7 +166,7 @@ class Processor : public Vst::AudioEffect {
 #else /* Linux */
     pthread_t  mLoadingThread;
 #endif /* platform */
-    String       mLoadingFile;
+    String       mLoadedFile;
     bool         mLoadingComplete;
 };
 

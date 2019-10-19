@@ -182,7 +182,7 @@ Processor::Processor() : mSynth(NULL), mChangeSoundFont(false), mLoadingThread(0
 void Processor::syncedLoadSoundFont() {
   char fileName[FILENAME_MAX];
   GetPath(fileName, FILENAME_MAX);
-  PathAppend(fileName, FILENAME_MAX, mLoadingFile.text8());
+  PathAppend(fileName, FILENAME_MAX, mLoadedFile.text8());
 
   fluid_synth_all_notes_off(mSynth, -1);
   fluid_synth_all_sounds_off(mSynth, -1);
@@ -191,7 +191,7 @@ void Processor::syncedLoadSoundFont() {
     int id = fluid_sfont_get_id(fluid_synth_get_sfont(mSynth, 0));
     fluid_synth_sfunload(mSynth, id, 1);
   }
-  if((mSoundFoundID = fluid_synth_sfload(mSynth, fileName, 1)) == FLUID_FAILED){
+  if((mSoundFontID = fluid_synth_sfload(mSynth, fileName, 1)) == FLUID_FAILED){
     printf("Failed '%s'...\n", fileName);
   }
   mLoadingComplete = true;
@@ -244,12 +244,24 @@ tresult PLUGIN_API Processor::canProcessSampleSize(int32 symbolicSampleSize){
 tresult PLUGIN_API Processor::setupProcessing(Vst::ProcessSetup& setup){
   tresult result = AudioEffect::setupProcessing(setup);
   if(result == kResultTrue){
-    // printf("Processor: SetupProcessing\n");
-    // TODO: set FR, block size, etc.
+    //printf("Processor: SetupProcessing\n");
+    // TODO: set block size, etc.
     if(fluid_settings_setnum(mSynthSettings, "synth.sample-rate", setup.sampleRate) == FLUID_FAILED){
       printf("Could not set sample rate to %f\n", setup.sampleRate);
     }
-    checkSoundFont(true); // load the font, in case it is already specified (normally should be the case)
+    // BAD SDK:
+    //   from common sense, we should not load any sound font till we know which one should be loaded
+    //   but reality is different. REAPER calls setupProcessing before setState, even in case it is
+    //   called later (the plug-in is instantiated from a project, from saved state).
+    //   In case last getState returns the same as default getState, setState is not called at all.
+    //   Finally, if plug-in is just instantiated, setState should not be called. And so,
+    //   we have no way to check the user wants not default font in this instance, we are forced
+    //   to always load default first.
+    if(!mSoundFontFile.text8()[0]){
+      mSoundFontFile = mSoundFontFiles.at(getCurrentSoundFontIdx()); // we know the list is not emply
+      mChangeSoundFont = true;
+    }
+    checkSoundFont(true);
     /*
     if((setup.sampleRate == Vst::kSample64) && (mAudioBufsSize < setup.maxSamplesPerBlock)){
       // we should be called with real time stopped
@@ -368,6 +380,7 @@ void Processor::playParChanges(Vst::ProcessData& data, int32 curSample, int32 en
 	      // we can not change here, but we schedule the change on restart
 	      if(mSoundFontFiles.size()){
 		int32 soundFontIdx = (value*(mSoundFontFiles.size()-1) + 0.5);
+		//printf("Processor: font change request\n");
 		if(mSoundFontFile != mSoundFontFiles.at(soundFontIdx)){
 		  mSoundFontFile = mSoundFontFiles.at(soundFontIdx);
 		  mChangeSoundFont = true;
@@ -475,11 +488,21 @@ tresult PLUGIN_API Processor::setProcessing (TBool state){
   return kResultTrue;
 }
 
-float Processor::getCurrentSoundFontNormalized(){
+int Processor::getCurrentSoundFontIdx(){
+  if(mSoundFontFiles.size() < 2)
+    return 0;
   auto it = std::find(mSoundFontFiles.begin(), mSoundFontFiles.end(), mSoundFontFile);
-  if((mSoundFontFiles.size() < 2) || (it == mSoundFontFiles.end()))
-    return 0.;
-  return (float)(it - mSoundFontFiles.begin()) / (mSoundFontFiles.size() - 1);
+  if(it == mSoundFontFiles.end()){ // can be if not set or not exist, return default
+    auto dit = std::find(mSoundFontFiles.begin(), mSoundFontFiles.end(), "default.sf2");
+    if(dit == mSoundFontFiles.end())
+      return 0.; // the first
+    return dit - mSoundFontFiles.begin();
+  }
+  return it - mSoundFontFiles.begin();
+}
+
+float Processor::getCurrentSoundFontNormalized(){
+  return (float)(getCurrentSoundFontIdx()) / (mSoundFontFiles.size() - 1);
 }
 
 
@@ -496,26 +519,30 @@ tresult PLUGIN_API Processor::setState(IBStream* state){
     return kResultFalse;
   mBypass = savedBypass > 0;
 
-  char *soundFontFile;
-  if(!(soundFontFile = streamer.readStr8())){
+  String newSoundFontFile;
+  char *soundFontFileCStr;
+  if(!(soundFontFileCStr = streamer.readStr8())){
     // can be, the first version was not saving it
-    mSoundFontFile = "default.sf2";
+    newSoundFontFile = "";
     //printf("Processor: using default font\n");
   } else {
-    mSoundFontFile = soundFontFile;
-    delete soundFontFile;
+    newSoundFontFile = soundFontFileCStr;
+    delete soundFontFileCStr;
     //printf("Processor: State font: %s\n", mSoundFontFile.text8());
   }
-  auto it = std::find(mSoundFontFiles.begin(), mSoundFontFiles.end(), mSoundFontFile);
-  if(it == mSoundFontFiles.end()){
-    if(mSoundFontFiles.size() > 0){
-      mSoundFontFile = mSoundFontFiles.at(0);
-      printf("Processor: font not found, using first available font\n");
+  if(!newSoundFontFile.text8()[0])
+    newSoundFontFile = mSoundFontFiles.at(getCurrentSoundFontIdx()); // the list is not empty after scanning
+  if(newSoundFontFile != mSoundFontFile){
+    mSoundFontFile = newSoundFontFile;
+    auto it = std::find(mSoundFontFiles.begin(), mSoundFontFiles.end(), mSoundFontFile);
+    if(it == mSoundFontFiles.end()){
+      mSoundFontFiles.push_back( mSoundFontFile ); // some not existing sound font, add it
+      std::sort(mSoundFontFiles.begin(), mSoundFontFiles.end());
+      sendProgramList();
     }
+    mChangeSoundFont = true;
+    sendCurrentProgram();
   }
-  mChangeSoundFont = true;
-  sendCurrentProgram();
-
   return kResultOk;
 }
 
@@ -526,32 +553,38 @@ tresult PLUGIN_API Processor::getState(IBStream* state){
 
   IBStreamer streamer(state, kLittleEndian);
   streamer.writeInt32(toSaveBypass);
-  streamer.writeStr8(mSoundFontFile.text8());
+  streamer.writeStr8(mSoundFontFile.text8()); // can be empty
   //printf("   Current sound font: %s\n", mSoundFontFile.text8());
 
+  // in case there will be no future setState, controller will be called with this state
+  // but "empty" font effectively means "default.sf2", in case it exist. And it can be not the first one.
+  sendCurrentProgram();
+
   return kResultOk;
+}
+
+void Processor::sendProgramList(){
+  Steinberg::Buffer buf;
+  for(auto const& fileName : mSoundFontFiles){
+    String name;
+    fileName.extract(name, 0, fileName.length() - 4); // remove ".sfX"
+    buf.appendString8(name); // UTF-8
+    buf.endString8();
+  }
+  Vst::IMessage* message = allocateMessage();
+  FReleaser msgReleaser(message);
+  if(message){
+    message->setMessageID("SoundFontFiles");
+    message->getAttributes()->setBinary("List", buf, buf.getFillSize());
+    //printf("  sending %d, first: %s\n", buf.getFillSize(), buf.str8());
+    sendMessage(message);
+  }
 }
 
 tresult PLUGIN_API Processor::connect (IConnectionPoint* other){
   if(Vst::AudioEffect::connect(other) == kResultOk){
     //printf("Processor: connected\n");
-    Steinberg::Buffer buf;
-    // TODO: fill it
-    for(auto const& fileName : mSoundFontFiles){
-      String name;
-      fileName.extract(name, 0, fileName.length() - 4); // remove ".sfX"
-      buf.appendString8(name); // UTF-8
-      buf.endString8();
-    }
-    Vst::IMessage* message = allocateMessage();
-    FReleaser msgReleaser(message);
-    if(message){
-      message->setMessageID("SoundFontFiles");
-      message->getAttributes()->setBinary("List", buf, buf.getFillSize());
-      //printf("  sending %d, first: %s\n", buf.getFillSize(), buf.str8());
-      sendMessage(message);
-    }
-    return kResultOk;
+    sendProgramList();
   }
   return kResultFalse;
 }
@@ -586,6 +619,7 @@ tresult PLUGIN_API Controller::initialize(FUnknown* context){
   Vst::ProgramList* prgList = new Vst::ProgramList(String("Sound Font"), kRootPrgId, Vst::kRootUnitId);
   addProgramList(prgList);
   prgList->addProgram(String("default")); // something crash otherwise...
+  mCurrentProgram = 0.; // we will be informed about real one
 
   Vst::Parameter* prgParam = prgList->getParameter();
   prgParam->getInfo().flags &= ~Vst::ParameterInfo::kCanAutomate;
@@ -652,21 +686,25 @@ tresult PLUGIN_API Controller::notify (Vst::IMessage* message){
       if(messageData && messageSize && !messageData[messageSize - 1]){
 	auto prgList = getProgramList(kRootPrgId);
 	auto prgPar  = dynamic_cast<Vst::StringListParameter *>(prgList->getParameter());
-	bool replaced = false; // there is no call to clear the list, so we replace the program name...
 	if(prgList && prgPar){
 	  const char *messageEnd = messageData + messageSize;
+	  // BAD SDK: there is no call to clear the list, so we can only replace...
+	  int32 currentProgramCount = prgList->getCount();
+	  int idx = 0;
+	  // printf(" Controller: font list\n");
 	  while(messageData < messageEnd){
 	    String soundFont;
 	    soundFont.fromUTF8(messageData);
-	    if(replaced){
+	    // printf("  %s\n", soundFont.text8());
+	    if(idx >= currentProgramCount){
 	      prgList->addProgram(soundFont);
 	      prgPar->appendString(soundFont);
 	    } else {
-	      prgList->setProgramName(0, soundFont);
-	      prgPar->replaceString(0, soundFont);
-	      replaced = true;
+	      prgList->setProgramName(idx, soundFont);
+	      prgPar->replaceString(idx, soundFont);
 	    }
 	    messageData += strlen(messageData) + 1;
+	    ++idx;
 	  }
 	  // TODO: set current value for parameter
 	  if(componentHandler)
@@ -681,9 +719,9 @@ tresult PLUGIN_API Controller::notify (Vst::IMessage* message){
     if(message->getAttributes()->getBinary("Value", (const void *&)messageData, messageSize) == kResultOk){
       // that should be an array of UTF8 strings
       if(messageData && (messageSize == sizeof(float))){
-	float cSoundFontNorm;
-	memcpy(&cSoundFontNorm, messageData, sizeof(float));
-	setParamNormalized(kRootPrgId, cSoundFontNorm); // processor had to precalculate correct value for us
+	memcpy(&mCurrentProgram, messageData, sizeof(float));
+	// processor has precalculate correct value for us, but we do not setNormalized here
+	// it can be just initial value and there will be more
 	return kResultTrue;
       }
     }
@@ -709,6 +747,13 @@ tresult PLUGIN_API Controller::setComponentState(IBStream* state){
   if(soundFontFileName = streamer.readStr8()){
     delete soundFontFileName;
   }
+  setParamNormalized(kRootPrgId, mCurrentProgram);
+  // BAD SDK: it is goot time now, we used messege to transfer it
+  //  It is unclear will host call GetState or SetState for processor in case of this one
+  //  REAPER called GetState first (so "empty"), but then it can call SetState and setComponentState
+  //  with the same (externally saved) state. So processor has no chance ot fix the state itself, effectively
+  //  we can not use saved file name for that reason.
+
   return kResultOk;
 }
 
@@ -881,11 +926,16 @@ void FluidSynthVST::Processor::scanSoundFonts(){
 	slash = FindData.cFileName;
       String s(slash);
       s.toMultiByte(kCP_Utf8);
-      mSoundFontFiles.push_back( s );
+      const char *cstr = s.text8();
+      // used pattern is translated using DOS wildcards, f.e. it will match name.sfpack
+      if((strlen(cstr) > 3) && !memcmp(cstr + strlen(cstr) - 4, ".sf", 3))
+	mSoundFontFiles.push_back( s );
     } while(FindNextFileW(hFind, &FindData));
     FindClose(hFind);
     std::sort(mSoundFontFiles.begin(), mSoundFontFiles.end());
   }
+  if(mSoundFontFiles.size() == 0)
+    mSoundFontFiles.push_back( "default.sf2" );
 }
 
 static DWORD WINAPI Processor_LoadingThread(void *par){
@@ -916,7 +966,7 @@ bool FluidSynthVST::Processor::checkSoundFont(bool synced){
   if(!mChangeSoundFont)
     return true;
   //printf("Processor: changing sound font %s\n", synced ? "synced" : "asynced");
-  mLoadingFile = mSoundFontFile;
+  mLoadedFile = mSoundFontFile;
   mChangeSoundFont = false;
   if(!synced){
     mLoadingComplete = false;
@@ -970,6 +1020,8 @@ void FluidSynthVST::Processor::scanSoundFonts(){
     closedir(dir);
     std::sort(mSoundFontFiles.begin(), mSoundFontFiles.end());
   }
+  if(mSoundFontFiles.size() == 0)
+    mSoundFontFiles.push_back( "default.sf2" );
 }
 
 #include <pthread.h>
@@ -1002,7 +1054,7 @@ bool FluidSynthVST::Processor::checkSoundFont(bool synced){
   if(!mChangeSoundFont)
     return true;
   //printf("Processor: changing sound font %s\n", synced ? "synced" : "asynced");
-  mLoadingFile = mSoundFontFile;
+  mLoadedFile = mSoundFontFile;
   mChangeSoundFont = false;
   if(!synced){
     mLoadingComplete = false;
