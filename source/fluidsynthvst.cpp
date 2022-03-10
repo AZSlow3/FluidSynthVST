@@ -220,6 +220,7 @@ tresult PLUGIN_API Processor::initialize(FUnknown* context){
   if(result == kResultTrue){
     addAudioInput(STR16("AudioInput"), Vst::SpeakerArr::kStereo);
     addAudioOutput(STR16("AudioOutput"), Vst::SpeakerArr::kStereo);
+    addEventInput(STR16("MIDIInput"), 16);
   }
   return result;
 }
